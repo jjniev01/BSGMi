@@ -1,0 +1,398 @@
+---
+title: Built-Settlement Growth Model - Interpolation (BSGMi)
+output:
+  html_document:
+    theme: readable
+    toc: true
+    toc_float: true
+    collapsed: true
+    toc_depth: 3
+    dev: png
+---
+```{r setup, echo = FALSE, results = "hide",message = FALSE, warning = FALSE}
+root <- "D:/Research/BSGM/"
+##  Set upper limit for population map plotting; may need to be adjusted for certain countries with very low or very high ppp counts
+maxpop <- 35
+##  Load the data necessary for carrying out the folder navigation:
+source(paste0(root,"input.R"))
+source(paste0(root,"config.R"))
+
+##  WARNING:  Do not knit this file directly; run the Generate BSGMi Metadata 
+##            Report.R script instead.
+
+##  Package loading ---
+require(dplyr)
+require(RCurl)
+require(rgdal)
+require(raster)
+require(ggplot2)
+require(randomForest)
+require(viridis)
+require(xtable)
+require(maptools)
+require(knitr)
+require(wpgpCovariates)
+require(wpUtilities)
+
+##  Set report output parameters:
+options(digits = 2, scipen = 6)
+
+
+##  Define Functions ---
+##  Define function for listing and querying file names in the FTP:
+directListingFTP <- function(url = "ftp.worldpop.org.uk", 
+                             subdir ="", 
+                             query = "",
+                             returnsub = TRUE,
+                             returnfull = FALSE,
+                             username = "", 
+                             password = ""){
+  ####
+  ##  url - location of the desired FTP
+  ##  subdir - path of any desired subdirectory within the main url (no leading 
+  ##           slash required)
+  ##  query - regular expression based query to be used to subset results of 
+  ##          files found at given url and subdirectory; default is to return 
+  ##          all
+  ##  returnsub - return the basenames with the sub directory prepended?
+  ##  returnfull - return the basenames with the full url and subdirectory, if 
+  ##               any?
+  ##  Note: requires RCurl package
+  ####
+  ##  Add any subdirectories to the url:
+  url <- paste0(url, subdir)
+  
+  ##  Define full FTP remote connection:
+  remote <- paste0("ftp://",username,":",password,"@",url)
+  
+  ##  Retrieve list of things at the defined path as a vector of file names:
+  filelist <- unlist(strsplit(getURL(remote,verbose=F,dirlistonly=T),"\r\n"))
+  
+  ##  Query the results:
+  if(query == ""){
+    query = ".*"
+  }
+  qfiles <- grep(query, filelist, perl = T, value = T)
+  
+  ##  If we have optons on how we want the files returned:
+  if(returnsub){
+    ##  Paste the sub directory to the file names:
+    filevector <- paste0(subdir,qfiles)
+  }
+  if(returnfull){
+    ##  Paste the full url with subdirectory to the filename:
+    filevector <- paste0(url,qfiles)
+  }
+  ##  Return the vector of filenames with or without prepended stuff:
+  return(filevector)
+}
+
+##  Define the direct download of extents function and the function for age 
+##  normalizing the rasters for output:
+directDownloadFTP <- function(url = "ftp.worldpop.org.uk", 
+                              subdir ="/WP515640_Global/", 
+                              query = "", 
+                              outdir = "",
+                              filelist = NULL,
+                              username = "",
+                              password = "",
+                              quiet = T){
+  remote <- paste0("ftp://",username,":",password,"@")
+  ##  If not given a vector of filenames:
+  if(is.null(filelist)){
+    ##  Perform the querying function to return a vector of desired file 
+    ##  basenames with the full directory attached for download later within the 
+    ##  function:
+    filelist = directListingFTP(url=url,
+                                subdir = subdir, 
+                                query = query,
+                                returnfull = T,
+                                returnsub = F,
+                                username = username,
+                                password = password)
+    
+  }
+  ##  For every file in the filelist:
+  for(f in filelist){
+    ## Note this is expecting the full file path.
+    file_remote <- paste0(remote,f)
+    ##  Download the file:
+    checkStatus <- tryCatch(
+    {
+      utils::download.file(file_remote, destfile=outdir,
+                           mode="wb",quiet=quiet, method="auto")
+    },
+    error=function(cond){
+      message(paste("URL does not seem to exist:", file_remote))
+      message("Here's the original error message:")
+      message(cond)
+    },
+    warning=function(cond){
+      message(paste("URL caused a warning:", file_remote))
+      message("Here's the original warning message:")
+      message(cond)
+    }
+    )
+  }
+  
+  if(inherits(checkStatus, "error") | inherits(checkStatus, "warning")){
+    return(NULL)
+  } else{
+    return(1)
+  }
+}
+    
+
+
+##  Begin data loading for report ---
+##  RandomForest object:
+load(paste0(root,"output/prj_",t0,"-",t1,"_",bsgm.input.countries,"/tmp/",
+            "bsgmfit_final_prj_",t0,"-",t1,"_",bsgm.input.countries,".RData"))
+##  Covariates object:
+load(paste0(root,"output/prj_",t0,"-",t1,"_",bsgm.input.countries,"/tmp/",
+            "covariates_RF_prj_",t0,"-",t1,"_",bsgm.input.countries,".RData"))
+##  Transition Raster:
+transition_raster <-raster(paste0(root,"output/prj_",t0,"-",t1,"_",
+                                  bsgm.input.countries,"/tmp/","prj_",t0,"-",t1,
+                                  "_",bsgm.input.countries,"_transition.tif"))
+##  Load the training data:
+if(file.exists(paste0(root,"output/prj_",t0,"-",t1,"_",bsgm.input.countries,
+                      "/tmp/prj_",t0,"-",t1,"_",bsgm.input.countries,
+                      "_1.00.RData"))){
+  load(paste0(root,"output/prj_",t0,"-",t1,"_",bsgm.input.countries,
+              "/tmp/prj_",t0,"-",t1,"_",bsgm.input.countries,"_1.00.RData"))
+  bsgm.table <- bsgm.table[,4:ncol(bsgm.table)]
+  partialplots <- TRUE
+}
+
+##  Pull covariate data from FTP:
+allcovariates <- wpgpListCountryCovariates(ISO3 = bsgm.input.countries, 
+                                           username = bsgm.ftp.username,
+                                           password = "we23ew2dZQ",
+                                           detailed = TRUE)
+##  Keep only the ones used in the model:
+predictive_covariates <- allcovariates[allcovariates$CvtName %in% names(bsgmfit_final$forest$xlevels),]
+
+##  Get the info regarding the BS extents we used for interpolation:
+extent_info <- allcovariates[allcovariates$CvtName %in% setdiff(names(covariates),
+                                                                c(predictive_covariates$CvtName,
+                                                                  "level1_water","ccidadminl1")),]
+
+##  Get plain english representation of the country:
+iso_english <- predictive_covariates$NameEnglish[1]
+```
+
+#  Metadata Report: `r iso_english` `r t0`-`r t1`  
+##  Method Summary
+Here we are interpolating for every year between an intial timepoint, _t0_, and a second time point, _t1_, which is at least two time units away (e.g. months, years, etc.) and for which we have observed built settlement (BS) extents. We start by training a Random Forest (RF) to produce a continuous surface across the study area representing the probability of a given pixel transitioning from non-BS to BS between _t0_ and _t1_. The RF is based upon a reduced set of covariates in order to not introduce any circularity into the later WorldPop population mapping.
+
+We continue by creating a population map for each of those two "anchor points" and, for each subnational administrative unit, extracting the time-specific population count which is coincident with the BS extents and deriving the corresponding average BS population density. We then interpolate, again on an administrative unit specific basis, the BS population count and BS population density using logistic growth/decay curves and arrive at an estimate of the intra-modelling period time step specific total BS extent area (in number of pixels) expected and, by subtraction from the inital BS count, the expected number of transitions for that time step. For every administrative unit, We then normalize these intra-modelling period expected transitions by the sum of all transitions for the modelling period and multiply them by the total observed changes, i.e. _t1_ BS extents minus _t0_ BS extents, in order to have all the intra-modelling period predicted transitions agree with the observed transitions. 
+
+Then for every time step, and on an admin. unit by admin. unit basis we take the RF transition probability layer and the estimated number of cells which transition. The most basic model simply chooses from the cells which were known to transition by selecting the _n_-th highest probabilities for transitioning, converts them to "BS", writes out the new BS extents, and uses those extents as the basemap for the next time step of transitioning. However, the default modeling setting utilizes admin.-unit normalized lagged lights-at-night (LAN) data to annual adjust the base RF-derived transition probabilities. The assumption behind this being that areas which underwent the largest increase in brightness, relative to the rest of the admin. unit, in a single time step have a higher probability of transitioning and vice versa. The transitioning procedure follows the same as above.
+
+This results in a series of regularly spaced time-specific binary spatial predictions of the BS extents in raster format.
+
+See the [BSGMi code repository](https://bitbucket.org/jjnieves/bsgm/overview) for more details and source code.
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+##  Input Covariates {.tabset}
+###  Built-Settlement Observed Extents   
+The following data were used as representations of built-settlement extent at the beginning and end years, `r t0` and `r t1`, respectively.
+<br/>
+<br/>
+
+```{r covariate_listing, echo = FALSE, warning = FALSE, cache = TRUE}
+##  Adjust the table formatting for table output:
+extent_info_form <- extent_info %>% dplyr::select(CvtName, Year, Description)
+names(extent_info_form) <- c("Covariate Name", "Year", "Description")
+kable(extent_info_form, row.names = FALSE, align = "lcl")
+rm(extent_info_form)
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+###  Predictive Covariates
+The following data were used as predictive covariates in the random forest model to produce the base non-built-settlement to built-settlement transition probability surface.
+<br/>
+<br/>
+
+```{r predictive_cov_table, echo = FALSE, warning = FALSE, cache = TRUE}
+##  Adjust the table formatting for table output:
+predictive_cov_form <- predictive_covariates %>% dplyr::select(CvtName, Year, Description)
+names(predictive_cov_form) <- c("Covariate Name", "Year", "Descritpion")
+kable(predictive_cov_form, row.names = FALSE, align = "lcl")
+rm(predictive_cov_form)
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+##  Random Forest Model {.tabset}
+This random forest (RF) object was trained using a stratified random sample of `r length(bsgmfit_final$y)` grid cells.  
+
+
+Note: Error and importances are estimated using Out-Of-Bag (OOB) values. Given that the RF is trained using an over-/under-sampled dataset to optimize the RF training performance, the positive predictive likelihood is over-inflated and the negative predictive likelihood is deflated relative to the country-wide prevalence of transitions. Transition prevalence is heterogeneous across a given country and as such there will be subnational areal units of high prevalence and low prevalence and, like any classifier, the performance of the RF will vary positively with transition prevalence. Further, these errors are calculated based upon using a static threshold "majority" vote of all trees (i.e. if there are 500 trees and two classes, then the class with at least 251 tree votes will be the RF output). It is important to remember that the BSGMi does not use a static threshold to determine transition/non-transition and that the RF simply provides the base transition probability for the study period. However, it is useful to understand how well the RF is predicting the transition probability by assessing its ability as a binary classifier.
+
+<br/>
+<br/>
+
+###  Overview
+```{r bsgmfit_final, echo = FALSE, fig.width = 10, fig.height = 10, out.width = "720px", out.height = "720px", cache = TRUE, warning = FALSE}
+bsgmfit_final
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+###  Variable Importance
+```{r bsgmfit_varimp, echo = FALSE, fig.width = 10, fig.height = 10,out.width = "720px", out.height = "720px", cache = TRUE, warning = FALSE}
+varImpPlot(bsgmfit_final, main = paste0("Covariate Importance Plot for ", iso_english, " RF Model"))
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+###  Class Error Stability
+```{r bsgmfit_error_stability, echo = FALSE, fig.width = 10, fig.height = 10, out.width = "720px", out.height = "720px", cache = TRUE, warning = FALSE}
+plot(bsgmfit_final, main=paste0("Class Prediction Error Stability for ", iso_english, " RF Model"))
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+##  Initial Population Surfaces {.tabset}
+### Population Surface `r t0`
+```{r pop_preview1, echo = F, fig.width = 10, fig.height = 10, out.width = "720px", out.height = "720px", cache = T, warning = F}
+##  Make sure we have a temporary folder created:
+if(!dir.exists(paste0(root,"MetadataTMP/"))){
+  dir.create(paste0(root,"MetadataTMP/"))
+  tmppath <- paste0(root,"MetadataTMP/")
+}else{
+  tmppath <- paste0(root,"MetadataTMP/")
+}
+##  Download the population surface if they do not already exist:
+if(!file.exists(paste0(tmppath,tolower(bsgm.input.countries),"_ppp_wpgp_",t0,".tif"))){
+  ##  Declare the expected full file path:
+  flist <-paste0("ftp.worldpop.org.uk/WP515640_Global/ppp_datasets/",
+                 t0,"/",bsgm.input.countries,"/",
+                 tolower(bsgm.input.countries),
+                 "_ppp_wpgp_",t0,".tif")
+  ##  Download file:
+  directDownloadFTP(filelist = flist,
+                    outdir = paste0(tmppath,"/",tolower(bsgm.input.countries),
+                                    "_ppp_wpgp_",t0,".tif"), 
+                    username = bsgm.ftp.username,
+                    password = bsgm.ftp.password)
+}
+poppath <- paste0(tmppath,
+                  tolower(bsgm.input.countries),"_ppp_wpgp_",t0,".tif")
+
+popras <- raster(poppath)
+spplot(popras, col.regions = viridis(30, option = "viridis"), 
+       zlim=c(0,maxpop),
+       par.settings = list(panel.background=list(col="grey35")))
+rm(popras)
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+### Population Surface `r t1`
+```{r pop_preview2, echo = F, fig.width = 10, fig.height = 10, out.width = "720px", out.height = "720px", cache = T, warning = F}
+##  Make sure we have a temporary folder created:
+if(!dir.exists(paste0(root,"MetadataTMP/"))){
+  dir.create(paste0(root,"MetadataTMP/"))
+  tmppath <- paste0(root,"MetadataTMP/")
+}else{
+  tmppath <- paste0(root,"MetadataTMP/")
+}
+##  Download the population surface if they do not already exist:
+if(!file.exists(paste0(tmppath,tolower(bsgm.input.countries),"_ppp_wpgp_",t1,".tif"))){
+  ##  Declare the expected full file path:
+  flist <-paste0("ftp.worldpop.org.uk/WP515640_Global/ppp_datasets/",
+                 t1,"/",bsgm.input.countries,"/",
+                 tolower(bsgm.input.countries),
+                 "_ppp_wpgp_",t1,".tif")
+  ##  Download file:
+  directDownloadFTP(filelist = flist,
+                    outdir = paste0(tmppath,"/",tolower(bsgm.input.countries),
+                                    "_ppp_wpgp_",t1,".tif"), 
+                    username = bsgm.ftp.username,
+                    password = bsgm.ftp.password)
+}
+poppath <- paste0(tmppath,
+                  tolower(bsgm.input.countries),"_ppp_wpgp_",t1,".tif")
+
+
+popras <- raster(poppath)
+spplot(popras, col.regions = viridis(30, option = "viridis"), 
+       zlim=c(0,maxpop),
+       par.settings = list(panel.background=list(col="grey35")))
+rm(popras)
+```
+
+<br/>
+<br/>
+
+***
+
+<br/>
+<br/>
+
+##  Predicted Extents Through Time
+```{r pred_extents, echo = FALSE, fig.width = 10, fig.height = 10,out.width = "720px", out.height = "720px", cache = TRUE, warning = FALSE}
+years <- seq(t0+1,t1-1,by =1)
+
+##  Get the initial extent covariate names:
+init_extent_names <- extent_info$CvtName
+
+##  Construct the expected annual extent raster names:
+bsgm_extents_names <- paste0("bsgm")
+
+```
+
+
+
+
+```{r clean_up, echo =F, warning = F}
+##  Remove files that were temporarily invoked for the metadata report construction:
+#do.call(file.remove, list(list.files("", full.names = TRUE)))
+```
