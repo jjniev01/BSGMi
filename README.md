@@ -1,5 +1,3 @@
-[![N|Solid](http://maps.worldpop.org.uk/img/worldpop-logo.png)](http://maps.worldpop.org.uk)
-
 # BSGM : Built-Settlement Growth Model v.1a
 ---
 
